@@ -1,24 +1,19 @@
 services:
   - type: web
-    name: telegram-pixel-bot
-    env: python
-    region: oregon
+    name: adimma-kann
+    runtime: python
+    repo: https://github.com/asnzodiac/Adimma-Kann.git
+    branch: main
+    rootDir: .
     plan: free
+    region: oregon
     buildCommand: |
       apt-get update && apt-get install -y ffmpeg
       pip install --upgrade pip
       pip install -r requirements.txt
-    startCommand: gunicorn bot:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
+    startCommand: gunicorn bot:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
       - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_ALLOWED_CHAT_ID
-        sync: false
-      - key: OPENWEATHER_API_KEY
-        sync: false
-      - key: CITY
         sync: false
       - key: GROQ_API_KEY
         sync: false
@@ -28,3 +23,6 @@ services:
         sync: false
       - key: GROQ_API_KEY3
         sync: false
+      - key: PORT
+        value: 5000
+    autoDeploy: true
