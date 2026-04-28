@@ -12,14 +12,11 @@ edge-tts==6.1.9
 SpeechRecognition==3.10.1
 pydub==0.25.1
 
-# Media processing
-Pillow==10.1.0
+# Media processing - UPDATED VERSIONS
+Pillow==11.0.0
 PyPDF2==3.0.1
 
 # Utilities
 aiohttp==3.9.1
 aiofiles==23.2.1
 requests==2.31.0
-
-# System
-ffmpeg-python==0.2.0
