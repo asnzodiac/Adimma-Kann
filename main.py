@@ -6,11 +6,11 @@ import uuid
 import hashlib
 import time
 import datetime
-import queue
-import threading
 import tempfile
 import webbrowser
 from urllib.parse import quote_plus
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 from groq import Groq
@@ -358,7 +358,7 @@ def call_groq_llama_stream(chat_id: int, user_text: str):
 
     keys = _get_all_groq_keys()
     if not keys:
-        return "Error: No Groq API keys set. Fill GROQ_API_KEY (and optional GROQ_API_KEY1..3) in .env.", None
+        return "Error: No Groq API keys set. Fill GROQ_API_KEY (and optional GROQ_API_KEY1..3) in environment variables.", None
 
     history = _history_for(chat_id)
 
@@ -552,18 +552,43 @@ def _allowed_chat(chat_id: int) -> bool:
         return str(chat_id) == str(allowed).strip()
 
 
+# Health check server for Render
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot is alive and running!')
+    
+    def log_message(self, format, *args):
+        pass  # Suppress HTTP logs
+
+
+def run_health_server():
+    """Run health check server on port 10000 for Render"""
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    print(f'Health check server running on port {port}')
+    server.serve_forever()
+
+
 def main():
     _load_groq_keys_into_env()
 
+    # Start health check server in background thread
+    health_thread = Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+
     token = get_env_ci('TELEGRAM_BOT_TOKEN')
     if not token:
-        print("Missing TELEGRAM_BOT_TOKEN. Put it in .env or environment.")
+        print("Missing TELEGRAM_BOT_TOKEN. Set it in environment variables.")
         return
 
     print('=== PROJECT PIXEL (TELEGRAM) ===')
     print(f"Wake word: '{WAKE_WORD}'. When asleep, it ignores messages unless you say the wake word.")
     print("Voice messages supported (requires ffmpeg installed).")
     print("Groq key rotation enabled: GROQ_API_KEY, GROQ_API_KEY1..3")
+    print('Health check server started for Render deployment')
     print('Polling Telegram updates...\n')
 
     offset = 0
