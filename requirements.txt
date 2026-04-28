@@ -3,3 +3,5 @@ edge-tts
 speechrecognition
 requests
 colorama
+flask
+gunicorn
