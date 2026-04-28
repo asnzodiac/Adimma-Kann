@@ -1,329 +1,525 @@
+"""
+Adimma-Kann: Voice-First Telegram Bot
+A witty, sarcastic AI assistant for 'sir'
+"""
+
 import os
-import json
-import hashlib
-import asyncio
 import logging
-from datetime import datetime, timedelta
-
-import requests
-import edge_tts
-import speech_recognition as sr
+import hashlib
 from flask import Flask, request
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import asyncio
 from groq import Groq
-from PIL import Image
-import io
-import PyPDF2
+import random
+from datetime import datetime
+import json
 
-# ========================= CONFIG =========================
-app = Flask(__name__)
+# Import custom utilities
+from utils.language_detector import LanguageDetector
+from utils.tts_handler import TTSHandler
+from utils.stt_handler import STTHandler
+from utils.media_processor import MediaProcessor
+from utils.conversation_manager import ConversationManager
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Logging setup
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# Environment Variables
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEYS = [
-    os.getenv("GROQ_API_KEY"),
-    os.getenv("GROQ_API_KEY1"),
-    os.getenv("GROQ_API_KEY2"),
-    os.getenv("GROQ_API_KEY3"),
-]
-GROQ_API_KEYS = [k for k in GROQ_API_KEYS if k]  # remove None
+# Environment variables
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+GROQ_API_KEYS = os.getenv('GROQ_API_KEYS', '').split(',')  # Comma-separated keys
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
+PORT = int(os.getenv('PORT', 8443))
+OWNER_ID = 733340342  # Sir's user ID
 
-OWNER_ID = 733340342
-WAKE_WORDS = ["hi", "hello", "wake up", "adimma"]
-SLEEP_COMMANDS = ["bye", "standby", "stop listening", "sleep", "good night"]
+# Validate configuration
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required")
+if not GROQ_API_KEYS or GROQ_API_KEYS == ['']:
+    raise ValueError("GROQ_API_KEYS environment variable is required")
 
-# Global storage
-conversation_history = {}      # chat_id -> list of messages
-listening_state = {}           # chat_id -> bool (True = listening)
-tts_cache = {}                 # md5 -> filename
+# ============================================================================
+# GLOBAL INSTANCES
+# ============================================================================
+
+app = Flask(__name__)
+bot = Bot(token=BOT_TOKEN)
+
+# Initialize utilities
+lang_detector = LanguageDetector()
+tts_handler = TTSHandler()
+stt_handler = STTHandler()
+media_processor = MediaProcessor()
+conversation_manager = ConversationManager()
 
 # Load character prompt
-def load_character():
+CHARACTER_PROMPT = ""
+try:
+    with open('character.txt', 'r', encoding='utf-8') as f:
+        CHARACTER_PROMPT = f.read().strip()
+    logger.info("Character prompt loaded successfully")
+except Exception as e:
+    logger.error(f"Failed to load character.txt: {e}")
+    CHARACTER_PROMPT = "You are Adimma Kann, a witty and sarcastic AI assistant."
+
+# Bot state management (wake/sleep per chat)
+bot_state = {}  # {chat_id: {"active": True/False, "language": "en/ml/manglish"}}
+
+# ============================================================================
+# GROQ CLIENT WITH KEY ROTATION
+# ============================================================================
+
+class GroqClientManager:
+    """Manages multiple Groq API keys with rotation"""
+    
+    def __init__(self, api_keys):
+        self.api_keys = [key.strip() for key in api_keys if key.strip()]
+        self.current_index = 0
+        logger.info(f"Initialized with {len(self.api_keys)} Groq API keys")
+    
+    def get_client(self):
+        """Get current Groq client and rotate"""
+        client = Groq(api_key=self.api_keys[self.current_index])
+        self.current_index = (self.current_index + 1) % len(self.api_keys)
+        return client
+    
+    def get_completion(self, messages, model="llama-3.3-70b-versatile", max_retries=3):
+        """Get completion with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                client = self.get_client()
+                response = client.chat.completions.create(
+                    messages=messages,
+                    model=model,
+                    temperature=0.8,
+                    max_tokens=1024,
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                logger.error(f"Groq API error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    raise
+                continue
+
+groq_manager = GroqClientManager(GROQ_API_KEYS)
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def get_bot_state(chat_id):
+    """Get or initialize bot state for a chat"""
+    if chat_id not in bot_state:
+        bot_state[chat_id] = {
+            "active": True,  # Always awake by default
+            "language": "en"
+        }
+    return bot_state[chat_id]
+
+def should_sleep(text):
+    """Check if message contains sleep command"""
+    sleep_commands = [
+        "bye", "standby", "stop listening", "sleep", 
+        "good night", "goodnight", "നല്ല രാത്രി", "പോയി വരാം"
+    ]
+    text_lower = text.lower().strip()
+    return any(cmd in text_lower for cmd in sleep_commands)
+
+def should_wake(text):
+    """Check if message contains wake command"""
+    wake_commands = [
+        "hi", "hello", "wake up", "adimma", "hey",
+        "ഹലോ", "എണീക്ക്", "അടിമ്മ"
+    ]
+    text_lower = text.lower().strip()
+    return any(cmd in text_lower for cmd in wake_commands)
+
+async def notify_owner_new_user(user):
+    """Notify owner when new user starts the bot"""
     try:
-        with open("character.txt", "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        logger.warning("character.txt not found. Using default.")
-        return "You are a witty and sarcastic AI assistant called Adimma Kann serving sir."
-
-SYSTEM_PROMPT = load_character()
-
-# Telegram helper functions
-def tg_send_message(chat_id, text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text})
-
-def tg_send_audio(chat_id, audio_path):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVoice"
-    with open(audio_path, "rb") as audio:
-        requests.post(url, data={"chat_id": chat_id}, files={"voice": audio})
-
-def tg_send_photo(chat_id, photo_path, caption=""):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    with open(photo_path, "rb") as photo:
-        requests.post(url, data={"chat_id": chat_id, "caption": caption}, files={"photo": photo})
-
-# Notify owner about new users
-def notify_owner(user):
-    try:
-        text = f"🆕 New user started the bot:\n" \
-               f"ID: {user.get('id')}\n" \
-               f"Name: {user.get('first_name')}\n" \
-               f"Username: @{user.get('username') or 'N/A'}"
-        tg_send_message(OWNER_ID, text)
+        message = (
+            f"🆕 *New User Started Bot*\n\n"
+            f"👤 Name: {user.first_name} {user.last_name or ''}\n"
+            f"🆔 User ID: `{user.id}`\n"
+            f"📱 Username: @{user.username or 'N/A'}\n"
+            f"🕐 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        await bot.send_message(
+            chat_id=OWNER_ID,
+            text=message,
+            parse_mode='Markdown'
+        )
+        logger.info(f"Notified owner about new user: {user.id}")
     except Exception as e:
         logger.error(f"Failed to notify owner: {e}")
 
-# Check if chat is allowed (add your allowed users/groups if needed)
-def is_allowed(chat_id, chat_type):
-    return True  # You can add restrictions later
+def build_system_prompt(language="en"):
+    """Build system prompt with language instruction"""
+    lang_instruction = {
+        "en": "Respond in English.",
+        "ml": "മലയാളത്തിൽ മറുപടി നൽകുക. Respond in Malayalam.",
+        "manglish": "Respond in Manglish (Romanized Malayalam mixed with English, like 'Entha sir, nallapole aanallo?')."
+    }
+    
+    instruction = lang_instruction.get(language, lang_instruction["en"])
+    return f"{CHARACTER_PROMPT}\n\nIMPORTANT: {instruction}"
 
-# TTS with caching
-async def text_to_speech(text: str) -> str:
-    if not text:
-        return None
-    hash_key = hashlib.md5(text.encode()).hexdigest()
-    if hash_key in tts_cache:
-        return tts_cache[hash_key]
+# ============================================================================
+# COMMAND HANDLERS
+# ============================================================================
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    
+    # Initialize bot state
+    state = get_bot_state(chat_id)
+    state["active"] = True
+    
+    # Notify owner if new user (not owner)
+    if user.id != OWNER_ID:
+        await notify_owner_new_user(user)
+    
+    welcome_message = (
+        "🎭 *Adimma Kann at your service!*\n\n"
+        "I'm your witty, slightly sarcastic AI assistant.\n\n"
+        "💬 Send me:\n"
+        "• Voice messages (English/Malayalam/Manglish)\n"
+        "• Text messages\n"
+        "• Photos\n"
+        "• Documents (PDFs)\n\n"
+        "🌐 I'll respond in the same language you use!\n\n"
+        "⌨️ Commands:\n"
+        "/help - Show instructions\n"
+        "/clear - Clear conversation history\n\n"
+        "😴 Say 'bye' or 'sleep' to put me on standby\n"
+        "👋 Say 'hi' or 'wake up' to activate me again"
+    )
+    
+    await update.message.reply_text(welcome_message, parse_mode='Markdown')
+    logger.info(f"User {user.id} started the bot")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help or /instruction command"""
+    help_text = """
+🎭 *Adimma Kann - Usage Instructions*
+
+*How to Use:*
+1️⃣ Just talk to me! Send voice or text messages
+2️⃣ I understand English, Malayalam, and Manglish
+3️⃣ I'll reply in the same language you use
+
+*Voice Messages:*
+🎤 Send voice notes - I'll transcribe and respond with voice + text
+
+*Text Messages:*
+💬 Type anything - I'll reply with wit and sarcasm
+
+*Images & Documents:*
+🖼️ Send photos - I'll analyze and comment
+📄 Send PDFs - I'll read and discuss them
+
+*Sleep/Wake Commands:*
+😴 Sleep: "bye", "standby", "good night", "sleep"
+👋 Wake: "hi", "hello", "wake up", "adimma"
+
+*Language Examples:*
+🇬🇧 English: "What's the weather like?"
+🇮🇳 Malayalam: "ഇന്ന് എന്താ പ്രോഗ്രാം?"
+🔤 Manglish: "Entha sir, nallapole aanallo?"
+
+*Commands:*
+/start - Restart the bot
+/help - Show this message
+/clear - Clear conversation history
+
+*Pro Tips:*
+✨ I'm always listening by default
+✨ I remember our last 20 messages
+✨ I can handle multiple languages in one conversation
+✨ My personality is slightly roasting but always helpful!
+
+Ready to chat? 🚀
+"""
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /clear command"""
+    chat_id = update.effective_chat.id
+    conversation_manager.clear_history(chat_id)
+    
+    await update.message.reply_text(
+        "🗑️ Conversation history cleared!\n\nStarting fresh, sir! 🎬"
+    )
+    logger.info(f"Cleared conversation history for chat {chat_id}")
+
+# ============================================================================
+# MESSAGE HANDLERS
+# ============================================================================
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages"""
+    chat_id = update.effective_chat.id
+    state = get_bot_state(chat_id)
+    
     try:
-        communicate = edge_tts.Communicate(text, voice="en-GB-RyanNeural")
-        filename = f"tts_cache/{hash_key}.mp3"
-        os.makedirs("tts_cache", exist_ok=True)
-        await communicate.save(filename)
-        tts_cache[hash_key] = filename
-        return filename
-    except Exception as e:
-        logger.error(f"TTS error: {e}")
-        return None
-
-def tts_to_mp3(text):
-    return asyncio.run(text_to_speech(text))
-
-# Improved STT with Malayalam support
-def transcribe_voice(file_id):
-    try:
-        # Download voice
-        file_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
-        file_path = requests.get(file_url).json()["result"]["file_path"]
-        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        # Download voice file
+        voice_file = await update.message.voice.get_file()
+        voice_path = f"voice_{chat_id}_{datetime.now().timestamp()}.ogg"
+        await voice_file.download_to_drive(voice_path)
         
-        ogg_path = f"voice_{file_id}.ogg"
-        with open(ogg_path, "wb") as f:
-            f.write(requests.get(download_url).content)
-
-        # Convert ogg to wav
-        wav_path = f"voice_{file_id}.wav"
-        os.system(f"ffmpeg -i {ogg_path} -ar 16000 -ac 1 -y {wav_path} -loglevel quiet")
-
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(wav_path) as source:
-            audio = recognizer.record(source)
-
-        # Try Malayalam first, then English (India)
-        for lang in ["ml-IN", "en-IN"]:
-            try:
-                text = recognizer.recognize_google(audio, language=lang)
-                if text:
-                    os.remove(ogg_path)
-                    os.remove(wav_path)
-                    return text.strip()
-            except:
-                continue
-
-        os.remove(ogg_path)
-        os.remove(wav_path)
-        return None
-
-    except Exception as e:
-        logger.error(f"STT Error: {e}")
-        return None
-
-# Simple image/document description using Groq Vision
-def describe_media(file_id, is_photo=True, mime_type=""):
-    try:
-        # Download file
-        file_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
-        file_path = requests.get(file_url).json()["result"]["file_path"]
-        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        # Transcribe
+        await update.message.reply_text("🎧 Listening...")
+        transcription = await stt_handler.transcribe(voice_path)
         
-        content = requests.get(download_url).content
-
-        if is_photo or "image" in mime_type:
-            # For images - use Groq vision model later in main flow
-            return "Image received. Describe this image in detail."
-
-        elif "pdf" in mime_type.lower():
-            pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
-            text = ""
-            for page in pdf_reader.pages[:3]:   # first 3 pages
-                text += page.extract_text() or ""
-            return f"PDF content: {text[:1500]}" if text else "PDF received but could not extract text."
-
-        return "Document received."
-
+        # Clean up
+        if os.path.exists(voice_path):
+            os.remove(voice_path)
+        
+        if not transcription:
+            await update.message.reply_text("😕 Sorry sir, couldn't hear you clearly. Try again?")
+            return
+        
+        logger.info(f"Voice transcribed: {transcription}")
+        
+        # Process as text message
+        await process_message(update, context, transcription)
+        
     except Exception as e:
-        logger.error(f"Media description error: {e}")
-        return "Failed to process the media."
+        logger.error(f"Voice handling error: {e}")
+        await update.message.reply_text("❌ Oops! Something went wrong with the voice message.")
 
-# Groq call (with key rotation)
-current_key_index = 0
-
-def call_groq(chat_id, user_message, media_description=None):
-    global current_key_index
-    if not GROQ_API_KEYS:
-        return "Sorry sir, API keys are not configured.", None
-
-    client = Groq(api_key=GROQ_API_KEYS[current_key_index])
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    # Add conversation history
-    if chat_id in conversation_history:
-        messages.extend(conversation_history[chat_id][-15:])
-
-    # Add media context if any
-    if media_description:
-        messages.append({"role": "user", "content": f"[Media] {media_description}\n\nUser said: {user_message}"})
-    else:
-        messages.append({"role": "user", "content": user_message})
-
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo messages"""
+    chat_id = update.effective_chat.id
+    state = get_bot_state(chat_id)
+    
+    if not state["active"]:
+        return
+    
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            temperature=0.8,
-            max_tokens=800
-        )
-        reply = response.choices[0].message.content.strip()
-
-        # Save to history
-        if chat_id not in conversation_history:
-            conversation_history[chat_id] = []
-        conversation_history[chat_id].append({"role": "user", "content": user_message})
-        conversation_history[chat_id].append({"role": "assistant", "content": reply})
-
-        return reply, None
-
+        await update.message.reply_text("🖼️ Analyzing image...")
+        
+        # Download photo
+        photo = update.message.photo[-1]  # Get highest resolution
+        photo_file = await photo.get_file()
+        photo_path = f"photo_{chat_id}_{datetime.now().timestamp()}.jpg"
+        await photo_file.download_to_drive(photo_path)
+        
+        # Process image
+        description = await media_processor.process_image(photo_path)
+        
+        # Clean up
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
+        
+        # Get caption if any
+        caption = update.message.caption or "What do you think about this image?"
+        
+        # Process with description
+        user_message = f"{caption}\n\n[Image description: {description}]"
+        await process_message(update, context, user_message)
+        
     except Exception as e:
-        logger.error(f"Groq Error: {e}")
-        current_key_index = (current_key_index + 1) % len(GROQ_API_KEYS)
-        return "Sir, I'm having some trouble thinking right now. Try again.", None
+        logger.error(f"Photo handling error: {e}")
+        await update.message.reply_text("❌ Couldn't process the image, sir!")
 
-# ====================== WEBHOOK ======================
-@app.route("/", methods=["GET"])
-def home():
-    return "Adimma Kann is running!"
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle document messages (especially PDFs)"""
+    chat_id = update.effective_chat.id
+    state = get_bot_state(chat_id)
+    
+    if not state["active"]:
+        return
+    
     try:
-        update = request.get_json(force=True)
-        if not update or "message" not in update:
-            return "ok", 200
+        document = update.message.document
+        
+        # Check file size (limit to 10MB)
+        if document.file_size > 10 * 1024 * 1024:
+            await update.message.reply_text("📄 File too large! Please send files under 10MB.")
+            return
+        
+        await update.message.reply_text("📄 Processing document...")
+        
+        # Download document
+        doc_file = await document.get_file()
+        doc_path = f"doc_{chat_id}_{datetime.now().timestamp()}_{document.file_name}"
+        await doc_file.download_to_drive(doc_path)
+        
+        # Process document
+        content = await media_processor.process_document(doc_path, document.file_name)
+        
+        # Clean up
+        if os.path.exists(doc_path):
+            os.remove(doc_path)
+        
+        if not content:
+            await update.message.reply_text("😕 Couldn't read the document. Is it a valid PDF or text file?")
+            return
+        
+        # Get caption if any
+        caption = update.message.caption or "Please analyze this document."
+        
+        # Process with content (truncate if too long)
+        if len(content) > 4000:
+            content = content[:4000] + "... (truncated)"
+        
+        user_message = f"{caption}\n\n[Document content:\n{content}]"
+        await process_message(update, context, user_message)
+        
+    except Exception as e:
+        logger.error(f"Document handling error: {e}")
+        await update.message.reply_text("❌ Couldn't process the document, sir!")
 
-        msg = update["message"]
-        chat = msg.get("chat", {})
-        chat_id = chat.get("id")
-        chat_type = chat.get("type")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages"""
+    text = update.message.text
+    await process_message(update, context, text)
 
-        if not chat_id or not is_allowed(chat_id, chat_type):
-            return "ok", 200
-
-        user = msg.get("from", {})
-
-        # Notify owner for new private chats
-        if chat_type == "private" and msg.get("text") == "/start":
-            notify_owner(user)
-
-        # Get input
-        user_text = None
-        media_description = None
-        is_media = False
-
-        if "text" in msg:
-            user_text = msg["text"].strip()
-
-        elif "voice" in msg:
-            user_text = transcribe_voice(msg["voice"]["file_id"])
-
-        elif "photo" in msg:
-            file_id = msg["photo"][-1]["file_id"]
-            caption = msg.get("caption", "")
-            media_description = describe_media(file_id, is_photo=True)
-            user_text = caption or "Describe this image"
-            is_media = True
-
-        elif "document" in msg:
-            file_id = msg["document"]["file_id"]
-            mime = msg["document"].get("mime_type", "")
-            media_description = describe_media(file_id, is_photo=False, mime_type=mime)
-            user_text = msg.get("caption", "Analyze this document")
-            is_media = True
-
-        if not user_text:
-            return "ok", 200
-
-        user_text_lower = user_text.lower().strip()
-
-        # Command Handling
-        if user_text_lower in ["/instruction", "/help"]:
-            help_text = (
-                "✅ *Adimma Kann Instructions*\n\n"
-                "• I am always listening by default.\n"
-                "• Say 'bye', 'standby', 'stop listening' or 'sleep' → I will stop responding.\n"
-                "• Say 'hi', 'hello', or 'wake up' → I will start listening again.\n"
-                "• Send voice messages in English or Malayalam.\n"
-                "• Send photos or documents — I can describe them.\n"
-                "• /clear → Clear conversation history\n"
-                "• /instruction → Show this message"
-            )
-            tg_send_message(chat_id, help_text)
-            return "ok", 200
-
-        if user_text_lower == "/clear":
-            conversation_history[chat_id] = []
-            tg_send_message(chat_id, "Conversation history cleared, sir.")
-            return "ok", 200
-
-        # Listening Logic
-        if chat_id not in listening_state:
-            listening_state[chat_id] = True   # Always awake by default
-
-        if any(cmd in user_text_lower for cmd in SLEEP_COMMANDS):
-            listening_state[chat_id] = False
-            tg_send_message(chat_id, "Understood sir. Standing by.")
-            return "ok", 200
-
-        if any(w in user_text_lower for w in WAKE_WORDS):
-            listening_state[chat_id] = True
-            tg_send_message(chat_id, "Yes sir, I'm back and listening.")
-            return "ok", 200
-
-        if not listening_state[chat_id]:
-            return "ok", 200   # Ignore messages when sleeping
-
-        # Get AI Reply
-        reply, _ = call_groq(chat_id, user_text, media_description)
-
-        # Send reply as voice + text
-        audio_path = tts_to_mp3(reply)
-        if audio_path:
-            tg_send_audio(chat_id, audio_path)
+async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Core message processing logic"""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    state = get_bot_state(chat_id)
+    
+    # Check for sleep command
+    if should_sleep(text):
+        state["active"] = False
+        response = random.choice([
+            "😴 Going on standby, sir. Wake me when you need me!",
+            "💤 Alright, taking a power nap. Just say 'hi' when you're back!",
+            "🌙 Good night, sir! Standing by...",
+            "😌 Okay sir, I'll be here when you need me."
+        ])
+        await update.message.reply_text(response)
+        logger.info(f"Bot sleeping for chat {chat_id}")
+        return
+    
+    # Check for wake command
+    if should_wake(text):
+        if not state["active"]:
+            state["active"] = True
+            response = random.choice([
+                "👋 Wide awake, sir! What can I do for you?",
+                "⚡ Back in action! What's up?",
+                "🎯 Activated and ready, sir!",
+                "😎 I'm here! What do you need?"
+            ])
+            await update.message.reply_text(response)
+            logger.info(f"Bot waking up for chat {chat_id}")
+            return
+    
+    # If bot is sleeping, ignore
+    if not state["active"]:
+        return
+    
+    try:
+        # Detect language
+        detected_lang = await lang_detector.detect(text)
+        state["language"] = detected_lang
+        logger.info(f"Detected language: {detected_lang} for message: {text[:50]}")
+        
+        # Get conversation history
+        history = conversation_manager.get_history(chat_id)
+        
+        # Build messages for Groq
+        messages = [
+            {"role": "system", "content": build_system_prompt(detected_lang)}
+        ]
+        
+        # Add conversation history
+        for msg in history:
+            messages.append(msg)
+        
+        # Add current message
+        messages.append({"role": "user", "content": text})
+        
+        # Show typing indicator
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        
+        # Get AI response
+        response = groq_manager.get_completion(messages)
+        
+        # Save to conversation history
+        conversation_manager.add_message(chat_id, "user", text)
+        conversation_manager.add_message(chat_id, "assistant", response)
+        
+        # Send text response
+        await update.message.reply_text(response)
+        
+        # Generate and send voice response
+        await context.bot.send_chat_action(chat_id=chat_id, action="record_voice")
+        
+        voice_file = await tts_handler.generate_speech(response, detected_lang)
+        
+        if voice_file and os.path.exists(voice_file):
+            with open(voice_file, 'rb') as audio:
+                await update.message.reply_voice(voice=audio)
+            logger.info(f"Sent voice response in {detected_lang}")
         else:
-            tg_send_message(chat_id, reply)
-
+            logger.warning("Voice generation failed, text-only response sent")
+        
     except Exception as e:
-        logger.error(f"Webhook Error: {e}")
-        try:
-            tg_send_message(chat_id, "Something went wrong sir.")
-        except:
-            pass
+        logger.error(f"Message processing error: {e}")
+        await update.message.reply_text(
+            "❌ Oops! My circuits got tangled. Give me a moment, sir!"
+        )
 
-    return "ok", 200
+# ============================================================================
+# WEBHOOK SETUP
+# ============================================================================
 
+@app.route('/')
+def index():
+    """Health check endpoint"""
+    return "Adimma Kann is alive! 🎭", 200
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+def webhook():
+    """Handle incoming updates via webhook"""
+    try:
+        update = Update.de_json(request.get_json(force=True), bot)
+        asyncio.run(application.process_update(update))
+        return "OK", 200
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return "Error", 500
+
+# ============================================================================
+# APPLICATION INITIALIZATION
+# ============================================================================
+
+# Create application
+application = Application.builder().token(BOT_TOKEN).build()
+
+# Register handlers
+application.add_handler(CommandHandler("start", start_command))
+application.add_handler(CommandHandler("help", help_command))
+application.add_handler(CommandHandler("instruction", help_command))
+application.add_handler(CommandHandler("clear", clear_command))
+application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+if __name__ == '__main__':
+    # Set webhook
+    asyncio.run(bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}"))
+    logger.info(f"Webhook set to: {WEBHOOK_URL}/{BOT_TOKEN}")
+    
+    # Run Flask app
+    app.run(host='0.0.0.0', port=PORT)
