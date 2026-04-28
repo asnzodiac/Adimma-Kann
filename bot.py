@@ -24,8 +24,8 @@ CYAN = '\x1b[96m'
 RESET = '\x1b[0m'
 
 EDGE_VOICE = 'en-GB-RyanNeural'
-WAKE_WORD = 'jarvis'
-STOP_PHRASES = ('stop listening', 'standby')
+WAKE_WORD = 'hi'
+STOP_PHRASES = ('stop listening', 'standby', 'bye')
 MAX_HISTORY_MESSAGES = 20
 
 conversation_history_by_chat = {}
