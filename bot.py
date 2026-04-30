@@ -5,15 +5,12 @@ A witty, sarcastic AI assistant for 'sir'
 
 import os
 import logging
-import hashlib
 from flask import Flask, request
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import asyncio
 from groq import Groq
 import random
 from datetime import datetime
-import json
 
 # Import custom utilities
 from utils.language_detector import LanguageDetector
@@ -26,32 +23,52 @@ from utils.conversation_manager import ConversationManager
 # CONFIGURATION
 # ============================================================================
 
-# Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-GROQ_API_KEYS = os.getenv('GROQ_API_KEYS', '').split(',')  # Comma-separated keys
+# Environment variables - FIXED TO MATCH .env
+BOT_TOKEN = os.getenv('TELEGRAM_TOKEN') or os.getenv('BOT_TOKEN')  # Support both
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
-PORT = int(os.getenv('PORT', 8443))
-OWNER_ID = 733340342  # Sir's user ID
+PORT = int(os.getenv('PORT', 10000))
+OWNER_ID = int(os.getenv('OWNER_ID', 733340342))
+
+# Groq API Keys - Support multiple formats
+def get_groq_keys():
+    """Get all Groq API keys from environment"""
+    keys = []
+    
+    # Check for comma-separated GROQ_API_KEYS first
+    multi_keys = os.getenv('GROQ_API_KEYS', '')
+    if multi_keys:
+        keys.extend([k.strip() for k in multi_keys.split(',') if k.strip()])
+    
+    # Check for individual keys
+    for i in range(4):
+        key_name = f'GROQ_API_KEY{i}' if i > 0 else 'GROQ_API_KEY'
+        key = os.getenv(key_name, '')
+        if key and key not in keys:
+            keys.append(key.strip())
+    
+    return keys
+
+GROQ_API_KEYS = get_groq_keys()
 
 # Validate configuration
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is required")
-if not GROQ_API_KEYS or GROQ_API_KEYS == ['']:
-    raise ValueError("GROQ_API_KEYS environment variable is required")
+    raise ValueError("TELEGRAM_TOKEN or BOT_TOKEN environment variable is required")
+if not GROQ_API_KEYS:
+    raise ValueError("At least one GROQ_API_KEY is required")
+
+logger.info(f"Loaded {len(GROQ_API_KEYS)} Groq API keys")
 
 # ============================================================================
 # GLOBAL INSTANCES
 # ============================================================================
 
 app = Flask(__name__)
-bot = Bot(token=BOT_TOKEN)
 
 # Initialize utilities
 lang_detector = LanguageDetector()
@@ -70,20 +87,20 @@ except Exception as e:
     logger.error(f"Failed to load character.txt: {e}")
     CHARACTER_PROMPT = "You are Adimma Kann, a witty and sarcastic AI assistant."
 
-# Bot state management (wake/sleep per chat)
-bot_state = {}  # {chat_id: {"active": True/False, "language": "en/ml/manglish"}}
+# Bot state management
+bot_state = {}
 
 # ============================================================================
-# GROQ CLIENT WITH KEY ROTATION
+# GROQ CLIENT MANAGER
 # ============================================================================
 
 class GroqClientManager:
     """Manages multiple Groq API keys with rotation"""
     
     def __init__(self, api_keys):
-        self.api_keys = [key.strip() for key in api_keys if key.strip()]
+        self.api_keys = api_keys
         self.current_index = 0
-        logger.info(f"Initialized with {len(self.api_keys)} Groq API keys")
+        logger.info(f"Initialized GroqClientManager with {len(self.api_keys)} keys")
     
     def get_client(self):
         """Get current Groq client and rotate"""
@@ -106,7 +123,7 @@ class GroqClientManager:
             except Exception as e:
                 logger.error(f"Groq API error (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt == max_retries - 1:
-                    raise
+                    return "Sorry sir, I'm having trouble thinking right now. Try again in a moment!"
                 continue
 
 groq_manager = GroqClientManager(GROQ_API_KEYS)
@@ -119,7 +136,7 @@ def get_bot_state(chat_id):
     """Get or initialize bot state for a chat"""
     if chat_id not in bot_state:
         bot_state[chat_id] = {
-            "active": True,  # Always awake by default
+            "active": True,
             "language": "en"
         }
     return bot_state[chat_id]
@@ -142,7 +159,7 @@ def should_wake(text):
     text_lower = text.lower().strip()
     return any(cmd in text_lower for cmd in wake_commands)
 
-async def notify_owner_new_user(user):
+async def notify_owner_new_user(context, user):
     """Notify owner when new user starts the bot"""
     try:
         message = (
@@ -152,7 +169,7 @@ async def notify_owner_new_user(user):
             f"📱 Username: @{user.username or 'N/A'}\n"
             f"🕐 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        await bot.send_message(
+        await context.bot.send_message(
             chat_id=OWNER_ID,
             text=message,
             parse_mode='Markdown'
@@ -166,7 +183,7 @@ def build_system_prompt(language="en"):
     lang_instruction = {
         "en": "Respond in English.",
         "ml": "മലയാളത്തിൽ മറുപടി നൽകുക. Respond in Malayalam.",
-        "manglish": "Respond in Manglish (Romanized Malayalam mixed with English, like 'Entha sir, nallapole aanallo?')."
+        "manglish": "Respond in Manglish (Romanized Malayalam mixed with English)."
     }
     
     instruction = lang_instruction.get(language, lang_instruction["en"])
@@ -181,13 +198,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     
-    # Initialize bot state
     state = get_bot_state(chat_id)
     state["active"] = True
     
-    # Notify owner if new user (not owner)
     if user.id != OWNER_ID:
-        await notify_owner_new_user(user)
+        await notify_owner_new_user(context, user)
     
     welcome_message = (
         "🎭 *Adimma Kann at your service!*\n\n"
@@ -209,7 +224,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"User {user.id} started the bot")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help or /instruction command"""
+    """Handle /help command"""
     help_text = """
 🎭 *Adimma Kann - Usage Instructions*
 
@@ -232,21 +247,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 😴 Sleep: "bye", "standby", "good night", "sleep"
 👋 Wake: "hi", "hello", "wake up", "adimma"
 
-*Language Examples:*
-🇬🇧 English: "What's the weather like?"
-🇮🇳 Malayalam: "ഇന്ന് എന്താ പ്രോഗ്രാം?"
-🔤 Manglish: "Entha sir, nallapole aanallo?"
-
 *Commands:*
 /start - Restart the bot
 /help - Show this message
 /clear - Clear conversation history
-
-*Pro Tips:*
-✨ I'm always listening by default
-✨ I remember our last 20 messages
-✨ I can handle multiple languages in one conversation
-✨ My personality is slightly roasting but always helpful!
 
 Ready to chat? 🚀
 """
@@ -272,16 +276,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_bot_state(chat_id)
     
     try:
-        # Download voice file
         voice_file = await update.message.voice.get_file()
         voice_path = f"voice_{chat_id}_{datetime.now().timestamp()}.ogg"
         await voice_file.download_to_drive(voice_path)
         
-        # Transcribe
         await update.message.reply_text("🎧 Listening...")
         transcription = await stt_handler.transcribe(voice_path)
         
-        # Clean up
         if os.path.exists(voice_path):
             os.remove(voice_path)
         
@@ -290,8 +291,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         logger.info(f"Voice transcribed: {transcription}")
-        
-        # Process as text message
         await process_message(update, context, transcription)
         
     except Exception as e:
@@ -309,23 +308,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("🖼️ Analyzing image...")
         
-        # Download photo
-        photo = update.message.photo[-1]  # Get highest resolution
+        photo = update.message.photo[-1]
         photo_file = await photo.get_file()
         photo_path = f"photo_{chat_id}_{datetime.now().timestamp()}.jpg"
         await photo_file.download_to_drive(photo_path)
         
-        # Process image
         description = await media_processor.process_image(photo_path)
         
-        # Clean up
         if os.path.exists(photo_path):
             os.remove(photo_path)
         
-        # Get caption if any
         caption = update.message.caption or "What do you think about this image?"
-        
-        # Process with description
         user_message = f"{caption}\n\n[Image description: {description}]"
         await process_message(update, context, user_message)
         
@@ -334,7 +327,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Couldn't process the image, sir!")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle document messages (especially PDFs)"""
+    """Handle document messages"""
     chat_id = update.effective_chat.id
     state = get_bot_state(chat_id)
     
@@ -344,22 +337,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         document = update.message.document
         
-        # Check file size (limit to 10MB)
         if document.file_size > 10 * 1024 * 1024:
             await update.message.reply_text("📄 File too large! Please send files under 10MB.")
             return
         
         await update.message.reply_text("📄 Processing document...")
         
-        # Download document
         doc_file = await document.get_file()
         doc_path = f"doc_{chat_id}_{datetime.now().timestamp()}_{document.file_name}"
         await doc_file.download_to_drive(doc_path)
         
-        # Process document
         content = await media_processor.process_document(doc_path, document.file_name)
         
-        # Clean up
         if os.path.exists(doc_path):
             os.remove(doc_path)
         
@@ -367,10 +356,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("😕 Couldn't read the document. Is it a valid PDF or text file?")
             return
         
-        # Get caption if any
         caption = update.message.caption or "Please analyze this document."
         
-        # Process with content (truncate if too long)
         if len(content) > 4000:
             content = content[:4000] + "... (truncated)"
         
@@ -389,7 +376,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     """Core message processing logic"""
     chat_id = update.effective_chat.id
-    user = update.effective_user
     state = get_bot_state(chat_id)
     
     # Check for sleep command
@@ -399,7 +385,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             "😴 Going on standby, sir. Wake me when you need me!",
             "💤 Alright, taking a power nap. Just say 'hi' when you're back!",
             "🌙 Good night, sir! Standing by...",
-            "😌 Okay sir, I'll be here when you need me."
         ])
         await update.message.reply_text(response)
         logger.info(f"Bot sleeping for chat {chat_id}")
@@ -413,7 +398,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 "👋 Wide awake, sir! What can I do for you?",
                 "⚡ Back in action! What's up?",
                 "🎯 Activated and ready, sir!",
-                "😎 I'm here! What do you need?"
             ])
             await update.message.reply_text(response)
             logger.info(f"Bot waking up for chat {chat_id}")
@@ -427,7 +411,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         # Detect language
         detected_lang = await lang_detector.detect(text)
         state["language"] = detected_lang
-        logger.info(f"Detected language: {detected_lang} for message: {text[:50]}")
+        logger.info(f"Detected language: {detected_lang}")
         
         # Get conversation history
         history = conversation_manager.get_history(chat_id)
@@ -437,11 +421,9 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             {"role": "system", "content": build_system_prompt(detected_lang)}
         ]
         
-        # Add conversation history
         for msg in history:
             messages.append(msg)
         
-        # Add current message
         messages.append({"role": "user", "content": text})
         
         # Show typing indicator
@@ -466,8 +448,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             with open(voice_file, 'rb') as audio:
                 await update.message.reply_voice(voice=audio)
             logger.info(f"Sent voice response in {detected_lang}")
-        else:
-            logger.warning("Voice generation failed, text-only response sent")
         
     except Exception as e:
         logger.error(f"Message processing error: {e}")
@@ -488,8 +468,16 @@ def index():
 def webhook():
     """Handle incoming updates via webhook"""
     try:
-        update = Update.de_json(request.get_json(force=True), bot)
-        asyncio.run(application.process_update(update))
+        json_data = request.get_json(force=True)
+        update = Update.de_json(json_data, application.bot)
+        
+        # Process update in event loop
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(application.process_update(update))
+        loop.close()
+        
         return "OK", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -516,10 +504,27 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_t
 # MAIN ENTRY POINT
 # ============================================================================
 
+def setup_webhook():
+    """Setup webhook on startup"""
+    import asyncio
+    
+    async def _setup():
+        await application.initialize()
+        webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        await application.bot.set_webhook(url=webhook_url)
+        logger.info(f"Webhook set to: {webhook_url}")
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_setup())
+    loop.close()
+
 if __name__ == '__main__':
-    # Set webhook
-    asyncio.run(bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}"))
-    logger.info(f"Webhook set to: {WEBHOOK_URL}/{BOT_TOKEN}")
+    # Setup webhook
+    if WEBHOOK_URL:
+        setup_webhook()
+    else:
+        logger.warning("No WEBHOOK_URL set - bot will not receive updates!")
     
     # Run Flask app
     app.run(host='0.0.0.0', port=PORT)
