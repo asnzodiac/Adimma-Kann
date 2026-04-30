@@ -2,6 +2,10 @@
 Text-to-Speech Handler
 Multiple voices including Jarvis-style, Sarvam AI for Malayalam.
 Falls back: edge-tts → gTTS on failure.
+
+Fix: Voice preferences are stored per language slot (EN vs ML) so the voice
+always matches the language of the text — no more garbled audio from feeding
+Malayalam into an English voice model or vice versa.
 """
 
 import asyncio
@@ -20,6 +24,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # VOICE CATALOGUE
 # Format: "key": (display_name, engine, voice_id, language_tag)
+# language_tag is "en" or "ml" — determines which slot this voice belongs to.
 # ============================================================================
 
 VOICE_CATALOGUE = {
@@ -46,58 +51,105 @@ VOICE_CATALOGUE = {
     "sarvam_diya":      ("🌟 Sarvam Diya (ML Female)",       "sarvam", "diya",                 "ml"),
 }
 
-# Default voice per detected language (used when user hasn't set a preference)
-DEFAULT_VOICE = {
-    "en":       "jarvis",
-    "ml":       "sarvam_anushka",
-    "manglish": "prabhat",
+# Voices that belong to each language slot.
+# "manglish" is treated as English for TTS purposes.
+_SLOT_FOR_LANG = {
+    "en":       "en",
+    "manglish": "en",
+    "ml":       "ml",
+}
+
+# Default voice key per slot — used when the user hasn't set a preference.
+DEFAULT_VOICE_PER_SLOT = {
+    "en": "jarvis",
+    "ml": "sarvam_anushka",
 }
 
 
+def _slot(language: str) -> str:
+    """Map a detected language string to a voice slot ('en' or 'ml')."""
+    return _SLOT_FOR_LANG.get(language, "en")
+
+
 class TTSHandler:
-    """Handle text-to-speech with user-selectable voices"""
+    """
+    Handle text-to-speech with per-language voice slots.
+
+    _user_voices[chat_id] is now a dict:  {"en": "jarvis", "ml": "sarvam_arvind"}
+    Setting /voice jarvis  → writes the EN slot.
+    Setting /voice midhun  → writes the ML slot.
+    Both slots are independent so the bot automatically picks the right voice
+    based on the language it detected in each message.
+    """
 
     CACHE_DIR = Path('tts_cache')
     SARVAM_API_KEY = os.getenv('SARVAM_API_KEY', '')
 
     def __init__(self):
         self.CACHE_DIR.mkdir(exist_ok=True)
-        self._user_voices: dict = {}   # chat_id → voice key
+        # chat_id → {"en": voice_key, "ml": voice_key}
+        self._user_voices: dict[int, dict[str, str]] = {}
         logger.info("TTS Handler initialised")
 
     # ── Voice management ─────────────────────────────────────────────────
 
     def set_voice(self, chat_id: int, voice_key: str) -> bool:
+        """
+        Store the voice preference in the correct language slot for this chat.
+        Returns False if voice_key is not in the catalogue.
+        """
         if voice_key not in VOICE_CATALOGUE:
             return False
-        self._user_voices[chat_id] = voice_key
-        logger.info(f"Voice set to '{voice_key}' for chat {chat_id}")
+
+        voice_lang_slot = VOICE_CATALOGUE[voice_key][3]  # "en" or "ml"
+
+        if chat_id not in self._user_voices:
+            self._user_voices[chat_id] = {}
+
+        self._user_voices[chat_id][voice_lang_slot] = voice_key
+        logger.info(
+            f"Voice slot '{voice_lang_slot}' set to '{voice_key}' for chat {chat_id}"
+        )
         return True
 
     def get_voice_key(self, chat_id: int, language: str) -> str:
-        if chat_id in self._user_voices:
-            return self._user_voices[chat_id]
-        return DEFAULT_VOICE.get(language, "jarvis")
+        """
+        Return the best voice key for this chat + detected language.
+        Looks up the correct slot (en/ml) so we never feed text to the
+        wrong language model.
+        """
+        slot = _slot(language)
+        user_prefs = self._user_voices.get(chat_id, {})
+        return user_prefs.get(slot, DEFAULT_VOICE_PER_SLOT[slot])
 
     def get_current_voice_name(self, chat_id: int, language: str) -> str:
         key = self.get_voice_key(chat_id, language)
         return VOICE_CATALOGUE[key][0]
 
     def get_voice_menu(self) -> str:
-        lines = ["🎙️ *Available Voices*\n"]
+        lines = [
+            "🎙️ *Available Voices*\n",
+            "_Each voice belongs to a language slot._",
+            "_EN voices fire for English/Manglish; ML voices for Malayalam._",
+            "_Both slots are saved independently — set one for each!_\n",
+        ]
         sections = [
-            ("🇬🇧🇺🇸 English", ["jarvis", "ryan", "davis", "tony", "aria", "jenny", "neerja", "prabhat"]),
-            ("🇮🇳 Malayalam — Edge TTS", ["sobhana", "midhun"]),
-            ("✨ Malayalam — Sarvam AI", ["sarvam_anushka", "sarvam_arvind", "sarvam_neel",
-                                          "sarvam_misha", "sarvam_amol", "sarvam_diya"]),
+            ("🇬🇧🇺🇸 English / Manglish slot", ["jarvis", "ryan", "davis", "tony",
+                                                   "aria", "jenny", "neerja", "prabhat"]),
+            ("🇮🇳 Malayalam slot — Edge TTS",   ["sobhana", "midhun"]),
+            ("✨ Malayalam slot — Sarvam AI",    ["sarvam_anushka", "sarvam_arvind",
+                                                   "sarvam_neel", "sarvam_misha",
+                                                   "sarvam_amol", "sarvam_diya"]),
         ]
         for section_title, keys in sections:
             lines.append(f"\n*{section_title}*")
             for k in keys:
                 name = VOICE_CATALOGUE[k][0]
                 lines.append(f"  `{k}` — {name}")
-        lines.append("\n*Usage:* `/voice jarvis`")
-        lines.append("_Voice sticks across all messages until you change it._")
+        lines.append("\n*Usage:*")
+        lines.append("`/voice jarvis`        — English voice → Jarvis")
+        lines.append("`/voice sarvam_arvind` — Malayalam voice → Arvind")
+        lines.append("_Both slots stay set independently until you change them._")
         return "\n".join(lines)
 
     # ── Main generate ────────────────────────────────────────────────────
@@ -105,25 +157,41 @@ class TTSHandler:
     async def generate_speech(self, text: str, language: str = 'en',
                                chat_id: int = 0):
         """
-        Generate speech. Returns path to mp3 file, or None (text-only fallback).
+        Generate speech for `text` in `language`.
+        Always picks a voice whose language tag matches the detected language,
+        so we never send Malayalam text to an English voice model.
+
+        Returns path to mp3 file, or None on total failure (text-only fallback).
         """
         voice_key = self.get_voice_key(chat_id, language)
-        display_name, engine, voice_id, _ = VOICE_CATALOGUE[voice_key]
+        display_name, engine, voice_id, voice_lang = VOICE_CATALOGUE[voice_key]
 
-        cache_key = hashlib.md5(f"{voice_key}|{text}".encode()).hexdigest()
+        # Safety guard: if somehow the voice slot language doesn't match the
+        # text language, fall back to the appropriate default so we never
+        # feed Malayalam text into an English voice or vice versa.
+        text_slot = _slot(language)
+        if voice_lang != text_slot:
+            safe_key  = DEFAULT_VOICE_PER_SLOT[text_slot]
+            logger.warning(
+                f"Voice '{voice_key}' (lang={voice_lang}) mismatches text lang "
+                f"'{language}' — falling back to '{safe_key}'"
+            )
+            voice_key   = safe_key
+            display_name, engine, voice_id, voice_lang = VOICE_CATALOGUE[voice_key]
+
+        cache_key  = hashlib.md5(f"{voice_key}|{text}".encode()).hexdigest()
         cache_path = self.CACHE_DIR / f"{cache_key}.mp3"
 
         if cache_path.exists():
             logger.info(f"TTS cache hit ({voice_key})")
             return str(cache_path)
 
-        logger.info(f"Generating TTS: voice='{voice_key}' engine='{engine}'")
+        logger.info(f"Generating TTS: voice='{voice_key}' engine='{engine}' lang='{language}'")
 
         success = False
         if engine == "sarvam":
             success = await self._sarvam_tts(text, voice_id, cache_path)
             if not success:
-                # Sarvam failed → try edge midhun as Malayalam fallback
                 logger.warning("Sarvam failed, trying edge-tts Malayalam fallback")
                 success = await self._edge_tts(text, "ml-IN-MidhunNeural", cache_path)
         else:
@@ -189,7 +257,7 @@ class TTSHandler:
                 logger.error(f"Sarvam TTS {resp.status_code}: {resp.text[:200]}")
                 return False
 
-            audio_b64 = resp.json()["audios"][0]
+            audio_b64  = resp.json()["audios"][0]
             audio_bytes = base64.b64decode(audio_b64)
 
             # Convert WAV → MP3
